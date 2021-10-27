@@ -1,0 +1,482 @@
+<?php
+
+namespace App\Services;
+
+use App\Exceptions\ThirdPartyServiceException;
+use App\Dtos\KendoxResponses\SearchCommercialInvoiceResponseDto;
+use App\Facades\Kendox;
+use App\Models\CustomsDeclaration;
+use App\Models\Document;
+use App\Models\OutboundConfirmation;
+use Carbon\Carbon;
+use Illuminate\Support\Facades\App;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Http;
+use GuzzleHttp\Exception\GuzzleException;
+use GuzzleHttp\Client;
+use GuzzleHttp\Exception\ConnectException;
+use GuzzleHttp\Exception\ClientException;
+use Illuminate\Support\Facades\Storage;
+
+class KendoxService
+{
+
+    protected $client;
+
+    /**
+     * @var string
+     */
+    protected $connectionId = '';
+
+    /**
+     * KendoxService constructor.
+     */
+    public function __construct()
+    {
+        //@todo should be moved to Laravel Http facade. Illuminate\Support\Facades\Http
+        $this->client = new Client([
+            'base_uri' => config('services.kendox.url')
+        ]);
+    }
+
+    /**
+     * @return string
+     */
+    public function getConnectionId(): string
+    {
+        if (empty($this->connectionId) && !App::runningUnitTests()) {
+            $this->logon();
+        }
+        return $this->connectionId;
+    }
+
+    /**
+     * @param string $connectionId
+     */
+    public function setConnectionId(string $connectionId): void
+    {
+        $this->connectionId = $connectionId;
+    }
+
+
+    /**
+     * Logout from Kendox
+     * @return mixed
+     * @throws ThirdPartyServiceException
+     */
+    public function logoff()
+    {
+        try {
+            $conId = $this->getConnectionId();
+            $result = $this->client->post('InfoShare/Json/Authentication/Logoff', [
+                \GuzzleHttp\RequestOptions::JSON => [
+                    "connectionId" => $this->getConnectionId()
+                ]
+            ]);
+            if ($result->getStatusCode() == 200) {
+                $this->setConnectionId('');
+            }
+            Log::info("Successfully logoff from Kendox for connectionId: " . $conId);
+        } catch (ConnectException $e) {
+            Log::critical('Failed to connect to Kendox: ' . $e->getMessage());
+            throw new ThirdPartyServiceException('Failed to connect to Kendox: ' . $e->getMessage());
+        } catch (ClientException $e) {
+            $result = json_decode($e->getResponse()->getBody()->getContents());
+            Log::critical(
+                'Failed to logout from Kendox: ' .
+                (is_object($result) && isset($result->Message)
+                    ? $result->Message
+                    : $e->getResponse()->getBody()->getContents()
+                )
+            );
+            throw new ThirdPartyServiceException(
+                'Failed to logout from Kendox: ' .
+                (is_object($result) && isset($result->Message)
+                    ? $result->Message
+                    : $e->getResponse()->getBody()->getContents()
+                )
+            );
+        }
+    }
+
+    /**
+     * Get Auth token on Kendox
+     * @return mixed
+     * @throws ThirdPartyServiceException
+     */
+    public function logon()
+    {
+        try {
+            $result = $this->client->post('InfoShare/Json/Authentication/Logon', [
+                \GuzzleHttp\RequestOptions::JSON => [
+                    'tenantName' => '',
+                    'userName' => config('services.kendox.username'),
+                    'passwordHashed' => config('services.kendox.password'),
+                    'clientId' => config('services.kendox.client'),
+                    'timeZoneOffsetMinutes' => 0
+                ]
+            ]);
+            $response = json_decode($result->getBody()->getContents());
+            if (isset($response->LogonResult) && isset($response->LogonResult->ConnectionId)) {
+                $this->setConnectionId($response->LogonResult->ConnectionId);
+            }
+            Log::info("Successfully logon to Kendox with connectionId: " . $this->getConnectionId());
+        } catch (ConnectException $e) {
+            Log::critical('Failed to connect to Kendox: ' . $e->getMessage());
+            throw new ThirdPartyServiceException('Failed to connect to Kendox: ' . $e->getMessage());
+        } catch (ClientException $e) {
+            $result = json_decode($e->getResponse()->getBody()->getContents());
+            Log::critical(
+                'Failed to get auth token on Kendox: ' .
+                (is_object($result) && isset($result->Message)
+                    ? $result->Message
+                    : $e->getResponse()->getBody()->getContents()
+                )
+            );
+            throw new ThirdPartyServiceException(
+                'Failed to get auth token on Kendox: ' .
+                (is_object($result) && isset($result->Message)
+                    ? $result->Message
+                    : $e->getResponse()->getBody()->getContents()
+                )
+            );
+        }
+    }
+
+    /**
+     * Upload Proforma Invoice document
+     * @param string $documentContent
+     * @param string $documentName
+     * @param array $properties
+     * @return mixed
+     * @throws ThirdPartyServiceException
+     */
+    public function createProformaDocument(string $documentContent, string $documentName, array $properties)
+    {
+        try {
+            Log::info("Starting to upload document to Kendox: " . $documentName);
+            $documentId = $this->uploadDocument($documentContent);
+            Log::info("Starting to create Proforma Invoice document on Kendox for documentId#: " . $documentId);
+            $result = $this->client->post('InfoShare/Json/Document/CreateDocument', [
+                \GuzzleHttp\RequestOptions::JSON => [
+                    "connectionId" => $this->getConnectionId(),
+                    "document" => [
+                        "Properties" => [
+                            [
+                                "PropertyTypeId" => config('services.kendox.proforma_properties.document_type'),
+                                "Values" => [$properties['document_type']]
+                            ],
+                            [
+                                "PropertyTypeId" => config('services.kendox.proforma_properties.project_number'),
+                                "Values" => [$properties['project_number']]
+                            ],
+                            [
+                                "PropertyTypeId" => config('services.kendox.proforma_properties.project_name'),
+                                "Values" => [$properties['project_name']]
+                            ],
+                            [
+                                "PropertyTypeId" => config('services.kendox.proforma_properties.customer_group_code'),
+                                "Values" => [$properties['customer_group_code']]
+                            ],
+                            [
+                                "PropertyTypeId" => config('services.kendox.proforma_properties.customer_group_name'),
+                                "Values" => [$properties['customer_group_name']]
+                            ],
+                            [
+                                "PropertyTypeId" => config('services.kendox.proforma_properties.land'),
+                                "Values" => [$properties['land']]
+                            ],
+                            [
+                                "PropertyTypeId" => config('services.kendox.proforma_properties.pos_id'),
+                                "Values" => [$properties['pos_id']]
+                            ],
+                            [
+                                "PropertyTypeId" => config('services.kendox.proforma_properties.delivery_address'),
+                                "Values" => [$properties['delivery_address']]
+                            ],
+                            [
+                                "PropertyTypeId" => config('services.kendox.proforma_properties.invoice_date'),
+                                "Values" => [$properties['invoice_date']]
+                            ],
+                            [
+                                "PropertyTypeId" => config('services.kendox.proforma_properties.invoice_number'),
+                                "Values" => [$properties['invoice_number']]
+                            ]
+                        ],
+                        "Blogs" => [],
+                        "AccessRightsEnumList" => [],
+                        "Reminders" => [],
+                        "Abonnements" => [],
+                        "DocumentData" => [],
+                        "InfoStoreId" => config('services.kendox.proforma_properties.infostore_id'),
+                        "ProtectionDomainId" => config('services.kendox.proforma_properties.domain_id'),
+                        "Name" => $documentName,
+                        "ImportTemplateId" => config('services.kendox.proforma_properties.template_id'),
+                        "LifeCycleManager" => [
+                            "NextLifeCycleStates" => [],
+                            "LifeCycleProtections" => [],
+                            "LifeCycleId" => null
+                        ]
+                    ],
+                    "fileId" => $documentId,
+                    "options" => [
+                        "MergePropertiesIntoDocument" => false,
+                        "Comment" => null,
+                        "Version" => null
+                    ]
+                ]
+            ]);
+            if ($result->getStatusCode() === 200) {
+                $document = json_decode($result->getBody()->getContents());
+                Log::info("Proforma Invoice with document name - " . $documentName . " has been created on Kendox " .
+                    "with Id# " . $document->CreateDocumentResult->Id);
+                return $document->CreateDocumentResult->Id;
+            } else {
+                $response = json_decode($result->getBody()->getContents());
+                Log::critical('Failed to create Proforma Invoice on Kendox: ' . $response->Message);
+                return false;
+            }
+        } catch (ConnectException $e) {
+            Log::critical('Failed to connect to Kendox during creating proforma invoice: ' . $e->getMessage());
+            throw new ThirdPartyServiceException(
+                'Failed to connect to Kendox during creating proforma invoice: ' . $e->getMessage()
+            );
+        } catch (ClientException $e) {
+            $result = json_decode($e->getResponse()->getBody()->getContents());
+            Log::critical(
+                'Failed to create Proforma Invoice on Kendox: ' .
+                (is_object($result) && isset($result->Message)
+                    ? $result->Message
+                    : $e->getResponse()->getBody()->getContents()
+                )
+            );
+            throw new ThirdPartyServiceException(
+                'Failed to create Proforma Invoice on Kendox: ' .
+                (is_object($result) && isset($result->Message)
+                    ? $result->Message
+                    : $e->getResponse()->getBody()->getContents()
+                )
+            );
+        }
+    }
+
+    /**
+     * @todo this method can be deleted in the future because we are not using it
+     * Delete document
+     * @param string $documentId
+     * @return bool
+     */
+    public function deleteDocument(string $documentId): bool
+    {
+        $result = $this->client->post('InfoShare/Json/Document/DeleteDocument', [
+            \GuzzleHttp\RequestOptions::JSON => [
+                "connectionId" => $this->getConnectionId(),
+                "documentId" => $documentId,
+                "ignoreRecycleBin" => false,
+                "doNotDeletePhysicalFiles" => false
+            ]
+        ]);
+        if ($result->getStatusCode() === 200) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    /**
+     * Upload document
+     * @param string $documentContent
+     * @return mixed
+     * @throws ThirdPartyServiceException
+     */
+    public function uploadDocument(string $documentContent)
+    {
+        try {
+            $result = $this->client->post('InfoShare/Json/File/UploadFileBase64', [
+                \GuzzleHttp\RequestOptions::JSON => [
+                    "connectionId" => $this->getConnectionId(),
+                    "fileContentbase64" => base64_encode($documentContent),
+                ]
+            ]);
+            $response = json_decode($result->getBody()->getContents());
+            if ($result->getStatusCode() === 200) {
+                Log::info('Uploaded document to Kendox with FileID: ' . $response->UploadFileBase64Result);
+                return $response->UploadFileBase64Result;
+            } else {
+                Log::critical('Failed to upload document to Kendox: ' . $response->Message);
+                return false;
+            }
+        } catch (ConnectException $e) {
+            Log::critical('Failed to connect to Kendox during uploading document: ' . $e->getMessage());
+            throw new ThirdPartyServiceException(
+                'Failed to connect to Kendox during uploading document: ' . $e->getMessage()
+            );
+        } catch (ClientException $e) {
+            $result = json_decode($e->getResponse()->getBody()->getContents());
+            Log::critical(
+                'Failed to upload document to Kendox: ' .
+                (is_object($result) && isset($result->Message)
+                    ? $result->Message
+                    : $e->getResponse()->getBody()->getContents()
+                )
+            );
+            throw new ThirdPartyServiceException(
+                'Failed to upload document to Kendox: ' .
+                (is_object($result) && isset($result->Message)
+                    ? $result->Message
+                    : $e->getResponse()->getBody()->getContents()
+                )
+            );
+        }
+    }
+
+    /**
+     * Download document
+     * @param string $documentId
+     * @return mixed
+     * @throws ThirdPartyServiceException
+     */
+    public function downloadDocument(string $documentId = '')
+    {
+        try {
+            $result = $this->client->post('InfoShare/Json/File/DownloadFile', [
+                \GuzzleHttp\RequestOptions::JSON => [
+                    "connectionId" => $this->getConnectionId(),
+                    "documentId" => $documentId,
+                    "ignoreHashValidation" => false,
+                ]
+            ]);
+            if ($result->getStatusCode() === 200) {
+                Log::info('Downloaded document from Kendox with documentId#: ' . $documentId);
+                return $result->getBody()->getContents();
+            } else {
+                $response = json_decode($result->getBody()->getContents());
+                Log::critical('Failed to download document with documentId#' . $documentId
+                    . ' from Kendox: ' . $response->Message);
+                return false;
+            }
+        } catch (ConnectException $e) {
+            Log::critical('Failed to connect to Kendox during downloading document: ' . $e->getMessage());
+            throw new ThirdPartyServiceException(
+                'Failed to connect to Kendox during downloading document: ' . $e->getMessage()
+            );
+        } catch (ClientException $e) {
+            $result = json_decode($e->getResponse()->getBody()->getContents());
+            Log::critical('Failed to download document with documentId# ' . $documentId . ' from Kendox: ' .
+                (is_object($result) && isset($result->Message)
+                    ? $result->Message
+                    : $e->getResponse()->getBody()->getContents()
+                ));
+
+            throw new ThirdPartyServiceException('Failed to download document with documentId# ' . $documentId
+                . ' from Kendox: ' . (is_object($result) && isset($result->Message)
+                                    ? $result->Message
+                                    : $e->getResponse()->getBody()->getContents()));
+        }
+    }
+
+    /**
+     * Get documents
+     * @param array $documentIds []
+     * @return mixed
+     * @throws ThirdPartyServiceException
+     */
+    public function getDocuments(array $documentIds = [])
+    {
+        try {
+            $result = $this->client->post('InfoShare/Json/Document/GetDocuments', [
+                \GuzzleHttp\RequestOptions::JSON => [
+                    'connectionId' => $this->getConnectionId(),
+                    'documentIds' => $documentIds,
+                    "options" => [
+                        "IgnoreDocumentNotFoundExceptions" => true,
+                        "IgnoreNotEnoughRightsException" => false,
+                    ]
+                ]
+            ]);
+            return json_decode($result->getBody()->getContents());
+        } catch (ClientException $e) {
+            $result = json_decode($e->getResponse()->getBody()->getContents());
+            Log::critical(
+                'Failed to get documents on Kendox: ' .
+                (is_object($result) && isset($result->Message)
+                    ? $result->Message
+                    : $e->getResponse()->getBody()->getContents()
+                )
+            );
+            throw new ThirdPartyServiceException(
+                'Failed to get documents on Kendox: ' .
+                (is_object($result) && isset($result->Message)
+                    ? $result->Message
+                    : $e->getResponse()->getBody()->getContents()
+                )
+            );
+        }
+    }
+
+    /**
+     * Search invoice by externalDeliveryId
+     * @param string $externalDeliveryId
+     * @return null|SearchCommercialInvoiceResponseDto
+     * @throws ThirdPartyServiceException
+     */
+    public function findInvoice(string $externalDeliveryId = '')
+    {
+        try {
+            $result = $this->client->post('InfoShare/Json/Search/Search', [
+                \GuzzleHttp\RequestOptions::JSON => [
+                    'connectionId' => $this->getConnectionId(),
+                    'searchDefinition' => [
+                        'Conditions' => [
+                            [
+                                'ComparisonEnum' => 'Equals',
+                                'PropertyTypeId' => config('services.kendox.properties.external_id'),
+                                'RelationEnum' => 'And',
+                                'Values' => [$externalDeliveryId]
+                            ]
+                        ],
+                        'FulltextWordRelation' => 'AND',
+                        'FulltextWords' => null,
+                        'PageSize' => 100,
+                        'SearchStores' => null,
+                        'UseWildCard' => true
+                    ],
+                    'resultProperties' => array_values(config('services.kendox.properties')),
+                    'resumePoint' => ''
+                ]
+            ]);
+            $response = json_decode($result->getBody()->getContents());
+            return new SearchCommercialInvoiceResponseDto($response);
+        } catch (ConnectException $e) {
+            Log::critical('Failed to connect to Kendox during search document: ' . $e->getMessage());
+            throw new ThirdPartyServiceException(
+                'Failed to connect to Kendox during search document: ' . $e->getMessage()
+            );
+        } catch (ClientException $e) {
+            $result = json_decode($e->getResponse()->getBody()->getContents());
+
+            Log::critical('Failed to search document with external delivery id ' . $externalDeliveryId .
+            ' on Kendox: ' . (is_object($result) && isset($result->Message)
+                ? $result->Message
+                : $e->getResponse()->getBody()->getContents()));
+
+
+            if (
+                is_object($result)
+                && isset($result->Message)
+                && strpos($result->Message, "The connection id") !== false
+                && strpos($result->Message, "isn't valid or has expired") !== false
+            ) {
+                $this->logon();
+                return null;
+            } else {
+                throw new ThirdPartyServiceException('Failed to search document with external delivery id '
+                . $externalDeliveryId . ' on Kendox: ' .
+                    (is_object($result) && isset($result->Message)
+                        ? $result->Message
+                        : $e->getResponse()->getBody()->getContents()
+                    ));
+            }
+        }
+    }
+}
